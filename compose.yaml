@@ -1,0 +1,93 @@
+name: generation-service
+
+x-app: &app
+  build: .
+  environment: &environment
+    DATABASE_URL: postgresql+asyncpg://generation:generation@db:5432/generation
+    WEBHOOK_SECRET: ${WEBHOOK_SECRET:-local-development-secret}
+    ALPHA_URL: http://alpha:8000
+    BETA_URL: http://beta:8000
+    CALLBACK_BASE_URL: http://service:8000
+    PROVIDER_TIMEOUT: ${PROVIDER_TIMEOUT:-60}
+    HTTP_TIMEOUT: ${HTTP_TIMEOUT:-5}
+    DISPATCH_LEASE: ${DISPATCH_LEASE:-10}
+    POLL_INTERVAL: ${POLL_INTERVAL:-1}
+
+services:
+  db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: generation
+      POSTGRES_USER: generation
+      POSTGRES_PASSWORD: generation
+    ports:
+      - "127.0.0.1:55432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U generation -d generation"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    <<: *app
+    command: ["uv", "run", "--no-sync", "alembic", "upgrade", "head"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  service:
+    <<: *app
+    command: ["uv", "run", "--no-sync", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", ".venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  alpha:
+    <<: *app
+    command: ["uv", "run", "--no-sync", "uvicorn", "app.fake_provider:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: *environment
+      PROVIDER_NAME: alpha
+    ports:
+      - "127.0.0.1:8001:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  beta:
+    <<: *app
+    command: ["uv", "run", "--no-sync", "uvicorn", "app.fake_provider:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: *environment
+      PROVIDER_NAME: beta
+    ports:
+      - "127.0.0.1:8002:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  tests:
+    <<: *app
+    profiles: ["test"]
+    command: ["uv", "run", "--no-sync", "pytest", "-q"]
+    environment:
+      <<: *environment
+      TEST_DATABASE_URL: postgresql+asyncpg://generation:generation@db:5432/generation_test
+      TEST_SERVICE_URL: http://service:8000
+      TEST_ALPHA_URL: http://alpha:8000
+      TEST_BETA_URL: http://beta:8000
+    depends_on:
+      service:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
